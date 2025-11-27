@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+boto3
+pandas
+psycopg2-binary
+pyyaml
+python-multipart
+openpyxl
+python-dotenv
+litellm
