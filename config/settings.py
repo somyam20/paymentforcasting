@@ -2,28 +2,28 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-# Expected canonical column names
+# Expected canonical column names (must match your Excel structure)
 EXPECTED_COLS = {
-"name": "customer_name",
-"entity_legal": "entity_legal_name",
-"holding": "holding_company_name",
-"date": "invoice_date",
-"sales_order": "sales_order_number",
-"invoice": "invoice_number",
-"pat_terms": "pay_terms",
-"due_date": "due_date",
-"salesperson": "sales_manager_name",
-"service_type": "service_type",
-"location": "location",
-"amt": "net_amount",
-"vat": "vat",
-"total_invoice": "total_invoice_amount",
-"receipt": "payment_date",
+    "name": "customer_name",                    # CUSTOMER NAME
+    "entity_legal": "entity_legal_name",        # ENTITY LEGAL NAME
+    "holding": "holding_company_name",          # HOLDING COMPANY NAME
+    "date": "invoice_date",                     # INVOICE DATE
+    "sales_order": "sales_order_number",        # SALES ORDER NUMBER
+    "invoice": "invoice_number",                # INVOICE NUMBER
+    "pat_terms": "pay_terms",                   # PAY TERMS
+    "due_date": "due_date",                     # DUE DATE
+    "salesperson": "sales_manager_name",        # SALES MANAGER NAME
+    "service_type": "service_type",             # SERVICE TYPE
+    "location": "location",                     # LOCATION
+    "amt": "net_amount",                        # NET AMOUNT (...)
+    "vat": "vat",                               # VAT (5%)
+    "total_invoice": "total_invoice_amount",    # TOTAL INVOICE AMT (...)
+    "receipt": "payment_date",                  # PAYMENT DATE
 }
 
 
 # DB and AWS configuration (pull from env)
-DATABASE_URL = os.getenv("DATABASE_URL") # example: postgres://user:pass@host:5432/db
+DATABASE_URL = os.getenv("DATABASE_URL")  # example: postgres://user:pass@host:5432/db
 AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 

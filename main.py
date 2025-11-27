@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from src.routes.upload import router as upload_router
 from src.routes.query import router as query_router
+import logging
+logging.basicConfig(level=logging.DEBUG)
 
 app = FastAPI(title="Generative AI Project - Upload & Query")
 
