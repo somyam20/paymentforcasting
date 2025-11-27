@@ -9,6 +9,12 @@ import io
 import logging
 import traceback
 
+logging.basicConfig(
+    level=logging.INFO,
+    filemode="a",
+    filename="app.log",
+    format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
