@@ -4,6 +4,7 @@ from src.utils.db import get_project_url, init_db, get_alias
 from src.utils.s3_utils import download_to_bytes, extract_filename_from_url
 from src.utils.normalize import read_input_file
 from src.utils.aliaser import make_alias
+from src.utils.prompts_loader import format_prompt
 from src.llm.lite_client import lite_client
 from config.settings import MOVING_AVG_WINDOW
 import pandas as pd
@@ -277,6 +278,26 @@ async def compute_customer_stats(df_alias: pd.DataFrame, name_col: str) -> dict:
     return customer_stats
 
 
+def format_customer_stats(customer_stats: dict) -> str:
+    """Format customer statistics for prompt inclusion"""
+    if not customer_stats:
+        return ""
+    
+    stats_lines = []
+    for alias, stats in customer_stats.items():
+        stats_lines.append(f"Customer: {alias}")
+        stats_lines.append(f"  - Total paid invoices: {stats['total_invoices']}")
+        stats_lines.append(f"  - Overall mean amount: ₹{stats['mean_amount']:.2f}")
+        stats_lines.append(f"  - Moving average amount (last {stats['moving_avg_window']} invoices): ₹{stats['moving_avg_amount']:.2f}")
+        stats_lines.append(f"  - Total amount paid: ₹{stats['total_paid']:.2f}")
+        stats_lines.append(f"  - Average payment delay: {stats['avg_delay_days']:.1f} days")
+        if stats['last_payment_date']:
+            stats_lines.append(f"  - Last payment date: {stats['last_payment_date']}")
+        stats_lines.append("")
+    
+    return "\n".join(stats_lines)
+
+
 @router.post("/query")
 async def query_project(req: QueryRequest):
     # Run sync init_db in thread pool
@@ -393,112 +414,36 @@ async def query_project(req: QueryRequest):
         logger.exception("✗ Failed to convert dataframe to CSV: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to convert to CSV: {e}")
 
-    # 9. Build LLM prompt with precomputed statistics
+    # 9. Build LLM prompt using prompts_loader
+    logger.info("")
+    logger.info("BUILDING LLM PROMPT FROM TEMPLATE")
+    logger.info("-" * 80)
     
-    # Format statistics for prompt
-    stats_text = ""
-    if customer_stats:
-        stats_text = "\n\nPRECOMPUTED CUSTOMER STATISTICS:\n"
-        stats_text += "-" * 60 + "\n"
-        for alias, stats in customer_stats.items():
-            stats_text += f"Customer: {alias}\n"
-            stats_text += f"  - Total paid invoices: {stats['total_invoices']}\n"
-            stats_text += f"  - Overall mean amount: ₹{stats['mean_amount']:.2f}\n"
-            stats_text += f"  - Moving average amount (last {stats['moving_avg_window']} invoices): ₹{stats['moving_avg_amount']:.2f}\n"
-            stats_text += f"  - Total amount paid: ₹{stats['total_paid']:.2f}\n"
-            stats_text += f"  - Average payment delay: {stats['avg_delay_days']:.1f} days\n"
-            if stats['last_payment_date']:
-                stats_text += f"  - Last payment date: {stats['last_payment_date']}\n"
-            stats_text += "\n"
-        stats_text += "-" * 60 + "\n"
-    
-    prompt = f"""
-You are an expert financial data analyst having a conversation with a business stakeholder. 
-Provide detailed, conversational, and easy-to-understand responses that tell the complete story.
+    try:
+        # Format customer statistics
+        formatted_stats = format_customer_stats(customer_stats)
+        
+        # Use statistics template to wrap the stats
+        stats_text = format_prompt(
+            "statistics_template",
+            customer_stats=formatted_stats
+        )
+        
+        # Build the full prompt using the main query template
+        prompt = format_prompt(
+            "llm_query_prompt",
+            data_text=data_text,
+            stats_text=stats_text,
+            transformed_query=transformed_query
+        )
+        
+        logger.info("✓ Built LLM prompt from template (%d characters)", len(prompt))
+        
+    except Exception as e:
+        logger.exception("✗ Failed to build prompt from template: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to build prompt: {e}")
 
-Below is the dataset with CUSTOMER NAMES replaced by ALIASES:
-------------------------------------------------------------
-{data_text}
-------------------------------------------------------------
-{stats_text}
-
-USER QUERY:
-{transformed_query}
-
-CRITICAL INSTRUCTIONS:
-The statistics above have been PRECOMPUTED for you. USE THESE EXACT NUMBERS in your response.
-Write in a natural, conversational tone as if you're explaining this to a colleague over coffee.
-
-YOUR APPROACH:
-1. Start with a direct answer to their question
-2. Then elaborate with context and details
-3. Explain what the numbers mean in practical terms
-4. Compare trends to give perspective
-5. Describe patterns you observe in the data
-6. Be specific with numbers, dates, and percentages
-7. Help them understand the "why" behind the numbers
-
-CONVERSATIONAL GUIDELINES:
-- Use natural language like "Looking at their payment history..." or "What's interesting here is..."
-- Explain trends: "Their recent invoices have been higher..." or "They've been pretty consistent..."
-- Give context: "Out of X invoices paid..." or "Over the past period..."
-- Make comparisons: "compared to their usual average of..." or "which is about X% higher than before"
-- Describe patterns: "They typically pay within X days..." or "There's a clear upward trend..."
-- Be conversational but professional
-- Avoid bullet points, use flowing paragraphs
-- Don't give recommendations, just describe what you see in the data
-
-AMOUNT PREDICTIONS:
-- Use the precomputed **moving_avg_amount** 
-- Explain it naturally: "Based on their last [window] invoices, they've been averaging around ₹[amount]..."
-- Compare to overall history: "This is actually [higher/lower] than their overall average of ₹[mean], suggesting their invoice amounts are [trending up/down/staying stable]"
-- Mention the percentage difference if significant
-- Explain what this trend might indicate about the business relationship
-
-DATE PREDICTIONS:
-- Calculate: next_payment_date = last_payment_date + avg_delay_days
-- Describe their payment timing naturally: "They usually take about [X] days to pay after receiving an invoice..."
-- Give the specific expected date: "Since their last payment was on [date], I'd expect the next one around [predicted_date]"
-- Describe their payment behavior: "They're fairly reliable" or "They tend to pay a bit late" etc.
-
-RESPONSE FORMAT:
-Write 3-4 detailed paragraphs that flow naturally, covering:
-
-Paragraph 1: Direct answer with immediate context
-- Answer their specific question right away
-- Give the key numbers (amount and/or date)
-- Mention how many invoices and total paid amount for context
-
-Paragraph 2: Historical context and patterns
-- Describe their overall payment history
-- Compare recent behavior to historical average
-- Explain any trends you notice (amounts increasing/decreasing, payment timing patterns)
-- Use specific numbers and percentages
-
-Paragraph 3: Detailed forecast explanation
-- Explain the predicted amount using moving average
-- Give the reasoning behind the date prediction
-- Describe their typical payment behavior
-- Mention data quality (how many invoices you're basing this on)
-
-Paragraph 4 (if needed): Additional observations
-- Any interesting patterns in their payment behavior
-- Confidence level in the prediction based on data consistency
-- What the trend direction tells us about the relationship
-
-IMPORTANT: 
-- Write in complete, flowing paragraphs - NO bullet points or lists
-- Be conversational and natural
-- Use the precomputed statistics
-- Include specific numbers, dates, and percentages
-- Make it feel like you're having a conversation, not writing a report
-
-Now provide a detailed, conversational response.
-"""
-
-    logger.info("✓ Built LLM prompt (%d characters)", len(prompt))
-
-    # 10. Call LLM (async) - FIXED: Use async_generate
+    # 10. Call LLM (async)
     logger.info("")
     logger.info("CALLING LLM")
     logger.info("-" * 80)
