@@ -1,11 +1,13 @@
+import asyncio
 import psycopg2
 import psycopg2.extras
 from config.settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
 
+
 def get_conn():
     if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT]):
         raise RuntimeError("Database configuration incomplete")
-    
+
     return psycopg2.connect(
         host=DB_HOST,
         database=DB_NAME,
@@ -13,6 +15,35 @@ def get_conn():
         password=DB_PASSWORD,
         port=DB_PORT
     )
+
+
+# -------------------------
+# ASYNC WRAPPERS
+# -------------------------
+
+async def async_init_db():
+    return await asyncio.to_thread(init_db)
+
+
+async def async_save_project(project_name: str, s3_url: str):
+    return await asyncio.to_thread(save_project, project_name, s3_url)
+
+
+async def async_get_project_url(project_name: str):
+    return await asyncio.to_thread(get_project_url, project_name)
+
+
+async def async_upsert_alias(project_name: str, customer_key: str, alias: str):
+    return await asyncio.to_thread(upsert_alias, project_name, customer_key, alias)
+
+
+async def async_get_alias(project_name: str, customer_key: str):
+    return await asyncio.to_thread(get_alias, project_name, customer_key)
+
+
+# -------------------------
+# ORIGINAL BLOCKING FUNCTIONS (UNCHANGED)
+# -------------------------
 
 def init_db():
     conn = get_conn()
@@ -36,16 +67,19 @@ def init_db():
     cur.close()
     conn.close()
 
+
 def save_project(project_name: str, s3_url: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO projects (project_name, s3_url) VALUES (%s, %s) ON CONFLICT (project_name) DO UPDATE SET s3_url = EXCLUDED.s3_url",
+        "INSERT INTO projects (project_name, s3_url) VALUES (%s, %s) "
+        "ON CONFLICT (project_name) DO UPDATE SET s3_url = EXCLUDED.s3_url",
         (project_name, s3_url),
     )
     conn.commit()
     cur.close()
     conn.close()
+
 
 def get_project_url(project_name: str) -> str | None:
     conn = get_conn()
@@ -56,22 +90,27 @@ def get_project_url(project_name: str) -> str | None:
     conn.close()
     return r[0] if r else None
 
+
 def upsert_alias(project_name: str, customer_key: str, alias: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO project_aliases (project_name, customer_key, alias) VALUES (%s,%s,%s) ON CONFLICT (project_name, customer_key) DO UPDATE SET alias = EXCLUDED.alias",
+        "INSERT INTO project_aliases (project_name, customer_key, alias) "
+        "VALUES (%s, %s, %s) "
+        "ON CONFLICT (project_name, customer_key) DO UPDATE SET alias = EXCLUDED.alias",
         (project_name, customer_key, alias),
     )
     conn.commit()
     cur.close()
     conn.close()
 
+
 def get_alias(project_name: str, customer_key: str) -> str | None:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT alias FROM project_aliases WHERE project_name = %s AND customer_key = %s",
+        "SELECT alias FROM project_aliases "
+        "WHERE project_name = %s AND customer_key = %s",
         (project_name, customer_key),
     )
     r = cur.fetchone()

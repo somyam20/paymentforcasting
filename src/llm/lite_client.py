@@ -1,6 +1,8 @@
 import os
+import asyncio
 from litellm import completion
 from config.settings import LITE_LLM_API_KEY, LITE_LLM_MODEL
+
 
 class LiteClient:
     def __init__(self, api_key: str = None, model: str = None):
@@ -10,6 +12,9 @@ class LiteClient:
         if not self.api_key:
             raise ValueError("LITE_LLM_API_KEY not set")
 
+    # ------------------------------------------------------
+    # ORIGINAL SYNC METHOD (UNCHANGED)
+    # ------------------------------------------------------
     def generate(self, prompt: str, max_tokens: int = 512):
         response = completion(
             model=self.model,
@@ -19,4 +24,12 @@ class LiteClient:
         )
         return response["choices"][0]["message"]["content"]
 
+    # ------------------------------------------------------
+    # ASYNC WRAPPER AROUND THE SYNC METHOD
+    # ------------------------------------------------------
+    async def async_generate(self, prompt: str, max_tokens: int = 512):
+        return await asyncio.to_thread(self.generate, prompt, max_tokens)
+
+
+# global client
 lite_client = LiteClient()

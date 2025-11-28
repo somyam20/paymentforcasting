@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import string
@@ -17,21 +18,41 @@ def _num_to_base(n: int, alphabet: str = ALPHABET) -> str:
         out.append(alphabet[r])
     return ''.join(reversed(out)) or alphabet[0]
 
-def make_alias(project_name: str, customer_key: str) -> str:
+
+async def make_alias(project_name: str, customer_key: str) -> str:
     try:
-        existing = get_alias(project_name, customer_key)
+        # --- WRAP BLOCKING GET ---
+        existing = await asyncio.to_thread(get_alias, project_name, customer_key)
         if existing:
-            logger.debug("make_alias: existing alias for project=%s customer=%s -> %s", project_name, customer_key, existing)
+            logger.debug(
+                "make_alias: existing alias for project=%s customer=%s -> %s",
+                project_name,
+                customer_key,
+                existing
+            )
             return existing
 
+        # PURE CPU → fast enough to run sync
         digest = hmac.new(ALIAS_SALT.encode(), customer_key.encode(), hashlib.sha256).hexdigest()
         num = int(digest[:16], 16)
         alias = _num_to_base(num)[:ALIAS_LENGTH]
 
-        upsert_alias(project_name, customer_key, alias)
-        logger.info("make_alias: created alias for project=%s customer=%s -> %s", project_name, customer_key, alias)
+        # --- WRAP BLOCKING UPSERT ---
+        await asyncio.to_thread(upsert_alias, project_name, customer_key, alias)
+
+        logger.info(
+            "make_alias: created alias for project=%s customer=%s -> %s",
+            project_name,
+            customer_key,
+            alias
+        )
         return alias
+
     except Exception as e:
-        logger.exception("make_alias: failed for project=%s customer=%s : %s", project_name, customer_key, e)
-        # bubble up error to caller
+        logger.exception(
+            "make_alias: failed for project=%s customer=%s : %s",
+            project_name,
+            customer_key,
+            e
+        )
         raise

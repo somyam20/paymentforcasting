@@ -12,6 +12,8 @@ import logging
 import traceback
 import re
 import os
+import asyncio
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +23,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 router = APIRouter()
+
 
 class QueryRequest(BaseModel):
     project_name: str
@@ -52,46 +56,31 @@ def extract_clean_answer(text: str) -> str:
     return answer
 
 
-@router.post("/query")
-def query_project(req: QueryRequest):
-    init_db()
-    logger.info("=" * 80)
-    logger.info("QUERY REQUEST START")
-    logger.info("Project: %s", req.project_name)
-    logger.info("Query: %s", req.query)
-    logger.info("=" * 80)
+async def process_customer_async(project_name: str, cust: str, idx: int, total: int) -> tuple:
+    """Helper to process single customer asynchronously"""
+    logger.info("")
+    logger.info("Processing customer %d/%d: '%s'", idx, total, cust)
+    
+    # Check if alias already exists (sync -> thread)
+    alias = await asyncio.to_thread(get_alias, project_name, cust)
+    
+    if alias:
+        logger.info("  ✓ Found existing alias: '%s' -> '%s'", cust, alias)
+        return (cust, alias)
+    else:
+        logger.info("  ⚙ No existing alias, generating new one...")
+        try:
+            # FIXED: await the make_alias coroutine
+            alias = await make_alias(project_name, cust)
+            logger.info("  ✓ Generated new alias: '%s' -> '%s'", cust, alias)
+            return (cust, alias)
+        except Exception as ex_alias:
+            logger.exception("  ✗ Failed to create alias for '%s': %s", cust, ex_alias)
+            return None
 
-    # 1. Get S3 URL
-    s3_url = get_project_url(req.project_name)
-    if not s3_url:
-        logger.error("Project not found in DB: %s", req.project_name)
-        raise HTTPException(status_code=404, detail="project not found")
-    logger.info("✓ Found S3 URL: %s", s3_url)
 
-    # 2. Download file
-    try:
-        data_bytes = download_to_bytes(s3_url)
-        logger.info("✓ Downloaded %d bytes from S3", len(data_bytes) if data_bytes else 0)
-    except Exception as e:
-        logger.exception("✗ Failed to download from S3: %s", e)
-        raise HTTPException(status_code=500, detail=f"failed to download from s3: {e}")
-
-    # FIX: Use the extract_filename_from_url function to properly handle pre-signed URLs
-    filename = extract_filename_from_url(s3_url)
-    logger.info("✓ Filename: %s", filename)
-
-    # 3. Parse file
-    try:
-        df = read_input_file(io.BytesIO(data_bytes), filename)
-        logger.info("✓ Parsed dataframe: shape=%s", df.shape)
-        logger.info("✓ Columns: %s", list(df.columns))
-        logger.info("✓ First 3 rows:\n%s", df.head(3).to_string(index=False))
-    except Exception as e:
-        logger.exception("✗ Failed to parse file: %s", e)
-        raise HTTPException(status_code=500, detail=f"failed to parse file: {e}")
-
-    # 4. Build alias mapping
-    name_col = "customer_name"
+async def build_alias_mapping(project_name: str, df: pd.DataFrame, name_col: str) -> dict:
+    """Async helper to build alias mapping"""
     mapping = {}  # real_name -> alias
     
     logger.info("-" * 80)
@@ -117,26 +106,20 @@ def query_project(req: QueryRequest):
         logger.info("✓ After cleaning: %d valid customers", len(unique_customers))
         logger.info("✓ Sample customers (top 5): %s", unique_customers[:5])
         
-        # Generate aliases for each customer
+        # Generate aliases for each customer (run in parallel where possible)
+        tasks = []
         for idx, cust in enumerate(unique_customers):
-            logger.info("")
-            logger.info("Processing customer %d/%d: '%s'", idx + 1, len(unique_customers), cust)
-            
-            # Check if alias already exists
-            alias = get_alias(req.project_name, cust)
-            
-            if alias:
-                logger.info("  ✓ Found existing alias: '%s' -> '%s'", cust, alias)
+            tasks.append(process_customer_async(project_name, cust, idx + 1, len(unique_customers)))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, Exception):
+                logger.exception("Error processing customer: %s", result)
+                continue
+            if result:
+                cust, alias = result
                 mapping[cust] = alias
-            else:
-                logger.info("  ⚙ No existing alias, generating new one...")
-                try:
-                    alias = make_alias(req.project_name, cust)
-                    logger.info("  ✓ Generated new alias: '%s' -> '%s'", cust, alias)
-                    mapping[cust] = alias
-                except Exception as ex_alias:
-                    logger.exception("  ✗ Failed to create alias for '%s': %s", cust, ex_alias)
-                    # Continue with other customers
         
         logger.info("")
         logger.info("-" * 80)
@@ -150,6 +133,192 @@ def query_project(req: QueryRequest):
     except Exception as e:
         logger.exception("✗ Error building alias mapping: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to build aliases: {e}")
+    
+    return mapping
+
+
+async def compute_single_customer_stats(df_alias: pd.DataFrame, name_col: str, alias: str, 
+                                       amount_col: str, payment_date_col: str, invoice_date_col: str, 
+                                       moving_avg_window: int) -> dict:
+    """Compute stats for single customer (CPU intensive -> thread)"""
+    def _compute():
+        # Filter data for this customer
+        customer_df = df_alias[df_alias[name_col] == alias].copy()
+        
+        # Filter only paid invoices (where payment_date is not null)
+        if payment_date_col:
+            paid_df = customer_df[customer_df[payment_date_col].notna()].copy()
+        else:
+            paid_df = customer_df.copy()
+        
+        if len(paid_df) == 0:
+            logger.info("Customer '%s': No paid invoices found", alias)
+            return {}
+        
+        stats = {
+            'total_invoices': len(paid_df),
+            'mean_amount': 0,
+            'moving_avg_amount': 0,
+            'moving_avg_window': 0,
+            'total_paid': 0,
+            'avg_delay_days': 0,
+            'last_payment_date': None
+        }
+        
+        # Calculate amount statistics
+        if amount_col and amount_col in paid_df.columns:
+            # Convert to numeric, handling any string formatting
+            amounts = pd.to_numeric(paid_df[amount_col], errors='coerce')
+            amounts = amounts.dropna()
+            
+            if len(amounts) > 0:
+                # Overall mean
+                stats['mean_amount'] = float(amounts.mean())
+                stats['total_paid'] = float(amounts.sum())
+                
+                # Moving average: take last N invoices (sorted by date if possible)
+                if payment_date_col and payment_date_col in paid_df.columns:
+                    # Sort by payment date to get most recent invoices
+                    paid_df_sorted = paid_df.sort_values(by=payment_date_col, ascending=False)
+                    recent_amounts = pd.to_numeric(paid_df_sorted[amount_col].head(moving_avg_window), errors='coerce')
+                    recent_amounts = recent_amounts.dropna()
+                else:
+                    # If no date column, just take last N rows
+                    recent_amounts = amounts.tail(moving_avg_window)
+                
+                if len(recent_amounts) > 0:
+                    stats['moving_avg_amount'] = float(recent_amounts.mean())
+                    stats['moving_avg_window'] = len(recent_amounts)
+        
+        # Calculate delay statistics
+        if payment_date_col and invoice_date_col:
+            try:
+                paid_df[payment_date_col] = pd.to_datetime(paid_df[payment_date_col], errors='coerce')
+                paid_df[invoice_date_col] = pd.to_datetime(paid_df[invoice_date_col], errors='coerce')
+                
+                # Calculate delays
+                delays = (paid_df[payment_date_col] - paid_df[invoice_date_col]).dt.days
+                delays = delays.dropna()
+                
+                if len(delays) > 0:
+                    stats['avg_delay_days'] = float(delays.mean())
+                
+                # Get last payment date
+                last_payment = paid_df[payment_date_col].max()
+                if pd.notna(last_payment):
+                    stats['last_payment_date'] = last_payment.strftime('%Y-%m-%d')
+                    
+            except Exception as e:
+                logger.warning("Failed to calculate dates for '%s': %s", alias, e)
+        
+        return {'alias': alias, 'stats': stats}
+    
+    return await asyncio.to_thread(_compute)
+
+
+async def compute_customer_stats(df_alias: pd.DataFrame, name_col: str) -> dict:
+    """Async helper to compute customer statistics"""
+    logger.info("")
+    logger.info("PRECOMPUTING CUSTOMER STATISTICS")
+    logger.info("-" * 80)
+    
+    # Moving average window size (number of recent invoices to consider)
+    MOVING_AVG_WINDOW = int(os.getenv("MOVING_AVG_WINDOW", "3"))
+    logger.info("Using moving average window: %d invoices", MOVING_AVG_WINDOW)
+    
+    customer_stats = {}
+    
+    try:
+        # Identify amount column (could be net_amount or total_invoice_amount)
+        amount_col = None
+        for col in ['total_invoice_amount', 'net_amount', 'amount']:
+            if col in df_alias.columns:
+                amount_col = col
+                break
+        
+        if not amount_col:
+            logger.warning("⚠ No amount column found, skipping statistics computation")
+        
+        # Identify date columns
+        payment_date_col = 'payment_date' if 'payment_date' in df_alias.columns else None
+        invoice_date_col = 'invoice_date' if 'invoice_date' in df_alias.columns else None
+        due_date_col = 'due_date' if 'due_date' in df_alias.columns else None
+        
+        logger.info("Using columns: amount=%s, payment_date=%s, invoice_date=%s", 
+                   amount_col, payment_date_col, invoice_date_col)
+        
+        # Get unique customers from aliased dataframe
+        unique_aliases = df_alias[name_col].dropna().unique()
+        
+        # Process customers in parallel
+        tasks = []
+        for alias in unique_aliases:
+            tasks.append(compute_single_customer_stats(df_alias, name_col, alias, amount_col, payment_date_col, invoice_date_col, MOVING_AVG_WINDOW))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, dict) and 'alias' in result:
+                alias = result['alias']
+                stats = result['stats']
+                customer_stats[alias] = stats
+                logger.info("Customer '%s': %d paid invoices, mean=%.2f, moving_avg=%.2f (window=%d), total=%.2f, avg_delay=%.1f days", 
+                           alias, stats['total_invoices'], stats['mean_amount'], 
+                           stats['moving_avg_amount'], stats['moving_avg_window'],
+                           stats['total_paid'], stats['avg_delay_days'])
+        
+        logger.info("-" * 80)
+        logger.info("Computed statistics for %d customers", len(customer_stats))
+        
+    except Exception as e:
+        logger.exception("✗ Failed to compute customer statistics: %s", e)
+        customer_stats = {}
+    
+    return customer_stats
+
+
+@router.post("/query")
+async def query_project(req: QueryRequest):
+    # Run sync init_db in thread pool
+    await asyncio.to_thread(init_db)
+    logger.info("=" * 80)
+    logger.info("QUERY REQUEST START")
+    logger.info("Project: %s", req.project_name)
+    logger.info("Query: %s", req.query)
+    logger.info("=" * 80)
+
+    # 1. Get S3 URL (sync -> thread)
+    s3_url = await asyncio.to_thread(get_project_url, req.project_name)
+    if not s3_url:
+        logger.error("Project not found in DB: %s", req.project_name)
+        raise HTTPException(status_code=404, detail="project not found")
+    logger.info("✓ Found S3 URL: %s", s3_url)
+
+    # 2. Download file (async)
+    try:
+        data_bytes = await asyncio.to_thread(download_to_bytes, s3_url)
+        logger.info("✓ Downloaded %d bytes from S3", len(data_bytes) if data_bytes else 0)
+    except Exception as e:
+        logger.exception("✗ Failed to download from S3: %s", e)
+        raise HTTPException(status_code=500, detail=f"failed to download from s3: {e}")
+
+    # FIX: Use the extract_filename_from_url function to properly handle pre-signed URLs
+    filename = extract_filename_from_url(s3_url)
+    logger.info("✓ Filename: %s", filename)
+
+    # 3. Parse file (async)
+    try:
+        df = await asyncio.to_thread(read_input_file, io.BytesIO(data_bytes), filename)
+        logger.info("✓ Parsed dataframe: shape=%s", df.shape)
+        logger.info("✓ Columns: %s", list(df.columns))
+        logger.info("✓ First 3 rows:\n%s", df.head(3).to_string(index=False))
+    except Exception as e:
+        logger.exception("✗ Failed to parse file: %s", e)
+        raise HTTPException(status_code=500, detail=f"failed to parse file: {e}")
+
+    # 4. Build alias mapping (async)
+    name_col = "customer_name"
+    mapping = await build_alias_mapping(req.project_name, df, name_col)
 
     if not mapping:
         logger.warning("⚠ WARNING: No aliases created! This means no customer names will be anonymized.")
@@ -212,127 +381,12 @@ def query_project(req: QueryRequest):
     else:
         logger.warning("⚠ Skipping query transformation (no mapping available)")
 
-    # 7. Precompute statistics for each customer
-    logger.info("")
-    logger.info("PRECOMPUTING CUSTOMER STATISTICS")
-    logger.info("-" * 80)
-    
-    # Moving average window size (number of recent invoices to consider)
-    MOVING_AVG_WINDOW = int(os.getenv("MOVING_AVG_WINDOW", "3"))
-    logger.info("Using moving average window: %d invoices", MOVING_AVG_WINDOW)
-    
-    customer_stats = {}
-    
-    try:
-        # Identify amount column (could be net_amount or total_invoice_amount)
-        amount_col = None
-        for col in ['total_invoice_amount', 'net_amount', 'amount']:
-            if col in df_alias.columns:
-                amount_col = col
-                break
-        
-        if not amount_col:
-            logger.warning("⚠ No amount column found, skipping statistics computation")
-        
-        # Identify date columns
-        payment_date_col = 'payment_date' if 'payment_date' in df_alias.columns else None
-        invoice_date_col = 'invoice_date' if 'invoice_date' in df_alias.columns else None
-        due_date_col = 'due_date' if 'due_date' in df_alias.columns else None
-        
-        logger.info("Using columns: amount=%s, payment_date=%s, invoice_date=%s", 
-                   amount_col, payment_date_col, invoice_date_col)
-        
-        # Get unique customers from aliased dataframe
-        unique_aliases = df_alias[name_col].dropna().unique()
-        
-        for alias in unique_aliases:
-            # Filter data for this customer
-            customer_df = df_alias[df_alias[name_col] == alias].copy()
-            
-            # Filter only paid invoices (where payment_date is not null)
-            if payment_date_col:
-                paid_df = customer_df[customer_df[payment_date_col].notna()].copy()
-            else:
-                paid_df = customer_df.copy()
-            
-            if len(paid_df) == 0:
-                logger.info("Customer '%s': No paid invoices found", alias)
-                continue
-            
-            stats = {
-                'total_invoices': len(paid_df),
-                'mean_amount': 0,
-                'moving_avg_amount': 0,
-                'moving_avg_window': 0,
-                'total_paid': 0,
-                'avg_delay_days': 0,
-                'last_payment_date': None
-            }
-            
-            # Calculate amount statistics
-            if amount_col and amount_col in paid_df.columns:
-                # Convert to numeric, handling any string formatting
-                amounts = pd.to_numeric(paid_df[amount_col], errors='coerce')
-                amounts = amounts.dropna()
-                
-                if len(amounts) > 0:
-                    # Overall mean
-                    stats['mean_amount'] = float(amounts.mean())
-                    stats['total_paid'] = float(amounts.sum())
-                    
-                    # Moving average: take last N invoices (sorted by date if possible)
-                    if payment_date_col and payment_date_col in paid_df.columns:
-                        # Sort by payment date to get most recent invoices
-                        paid_df_sorted = paid_df.sort_values(by=payment_date_col, ascending=False)
-                        recent_amounts = pd.to_numeric(paid_df_sorted[amount_col].head(MOVING_AVG_WINDOW), errors='coerce')
-                        recent_amounts = recent_amounts.dropna()
-                    else:
-                        # If no date column, just take last N rows
-                        recent_amounts = amounts.tail(MOVING_AVG_WINDOW)
-                    
-                    if len(recent_amounts) > 0:
-                        stats['moving_avg_amount'] = float(recent_amounts.mean())
-                        stats['moving_avg_window'] = len(recent_amounts)
-                        logger.info("  Moving avg calculated from %d most recent invoices", len(recent_amounts))
-            
-            # Calculate delay statistics
-            if payment_date_col and invoice_date_col:
-                try:
-                    paid_df[payment_date_col] = pd.to_datetime(paid_df[payment_date_col], errors='coerce')
-                    paid_df[invoice_date_col] = pd.to_datetime(paid_df[invoice_date_col], errors='coerce')
-                    
-                    # Calculate delays
-                    delays = (paid_df[payment_date_col] - paid_df[invoice_date_col]).dt.days
-                    delays = delays.dropna()
-                    
-                    if len(delays) > 0:
-                        stats['avg_delay_days'] = float(delays.mean())
-                    
-                    # Get last payment date
-                    last_payment = paid_df[payment_date_col].max()
-                    if pd.notna(last_payment):
-                        stats['last_payment_date'] = last_payment.strftime('%Y-%m-%d')
-                        
-                except Exception as e:
-                    logger.warning("Failed to calculate dates for '%s': %s", alias, e)
-            
-            customer_stats[alias] = stats
-            logger.info("Customer '%s': %d paid invoices, mean=%.2f, moving_avg=%.2f (window=%d), total=%.2f, avg_delay=%.1f days", 
-                       alias, stats['total_invoices'], stats['mean_amount'], 
-                       stats['moving_avg_amount'], stats['moving_avg_window'],
-                       stats['total_paid'], stats['avg_delay_days'])
-        
-        logger.info("-" * 80)
-        logger.info("Computed statistics for %d customers", len(customer_stats))
-        
-    except Exception as e:
-        logger.exception("✗ Failed to compute customer statistics: %s", e)
-        # Continue without stats, LLM will work with raw data
-        customer_stats = {}
-    
+    # 7. Precompute statistics for each customer (async)
+    customer_stats = await compute_customer_stats(df_alias, name_col)
+
     # 8. Convert to CSV for LLM
     try:
-        data_text = df_alias.to_csv(index=False)
+        data_text = await asyncio.to_thread(df_alias.to_csv, index=False)
         logger.info("✓ Converted dataframe to CSV (%d characters)", len(data_text))
         logger.info("CSV preview (first 500 chars):\n%s", data_text[:500])
     except Exception as e:
@@ -444,13 +498,13 @@ Now provide a detailed, conversational response.
 
     logger.info("✓ Built LLM prompt (%d characters)", len(prompt))
 
-    # 10. Call LLM
+    # 10. Call LLM (async) - FIXED: Use async_generate
     logger.info("")
     logger.info("CALLING LLM")
     logger.info("-" * 80)
     
     try:
-        llm_response = lite_client.generate(prompt)
+        llm_response = await lite_client.async_generate(prompt)
         logger.info("✓ LLM responded (%d characters)", len(llm_response))
         logger.info("LLM response preview:\n%s", llm_response[:500])
     except Exception as e:
