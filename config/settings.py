@@ -22,11 +22,17 @@ EXPECTED_COLS = {
 }
 
 
-# DB and AWS configuration (pull from env)
-DATABASE_URL = os.getenv("DATABASE_URL")  # example: postgres://user:pass@host:5432/db
+# DB configuration (individual parameters)
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_PORT = os.getenv("DB_PORT", "5432")  # Default PostgreSQL port
+
+# AWS configuration (pull from env)
 AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-
+MOVING_AVG_WINDOW=os.getenv("MOVING_AVG_WINDOWS","3")
 
 # Lite LLM / model configuration
 LITE_LLM_API_KEY = os.getenv("LITE_LLM_API_KEY")

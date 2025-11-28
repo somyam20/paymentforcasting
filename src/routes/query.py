@@ -1,15 +1,17 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from src.utils.db import get_project_url, init_db, get_alias
-from src.utils.s3_utils import download_to_bytes
+from src.utils.s3_utils import download_to_bytes, extract_filename_from_url
 from src.utils.normalize import read_input_file
 from src.utils.aliaser import make_alias
 from src.llm.lite_client import lite_client
+from config.settings import MOVING_AVG_WINDOW
 import pandas as pd
 import io
 import logging
 import traceback
 import re
+import os
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,7 +76,8 @@ def query_project(req: QueryRequest):
         logger.exception("✗ Failed to download from S3: %s", e)
         raise HTTPException(status_code=500, detail=f"failed to download from s3: {e}")
 
-    filename = s3_url.split("/")[-1]
+    # FIX: Use the extract_filename_from_url function to properly handle pre-signed URLs
+    filename = extract_filename_from_url(s3_url)
     logger.info("✓ Filename: %s", filename)
 
     # 3. Parse file
@@ -126,7 +129,7 @@ def query_project(req: QueryRequest):
                 logger.info("  ✓ Found existing alias: '%s' -> '%s'", cust, alias)
                 mapping[cust] = alias
             else:
-                logger.info("  → No existing alias, generating new one...")
+                logger.info("  ⚙ No existing alias, generating new one...")
                 try:
                     alias = make_alias(req.project_name, cust)
                     logger.info("  ✓ Generated new alias: '%s' -> '%s'", cust, alias)
@@ -214,6 +217,10 @@ def query_project(req: QueryRequest):
     logger.info("PRECOMPUTING CUSTOMER STATISTICS")
     logger.info("-" * 80)
     
+    # Moving average window size (number of recent invoices to consider)
+    MOVING_AVG_WINDOW = int(os.getenv("MOVING_AVG_WINDOW", "3"))
+    logger.info("Using moving average window: %d invoices", MOVING_AVG_WINDOW)
+    
     customer_stats = {}
     
     try:
@@ -255,6 +262,8 @@ def query_project(req: QueryRequest):
             stats = {
                 'total_invoices': len(paid_df),
                 'mean_amount': 0,
+                'moving_avg_amount': 0,
+                'moving_avg_window': 0,
                 'total_paid': 0,
                 'avg_delay_days': 0,
                 'last_payment_date': None
@@ -267,8 +276,24 @@ def query_project(req: QueryRequest):
                 amounts = amounts.dropna()
                 
                 if len(amounts) > 0:
+                    # Overall mean
                     stats['mean_amount'] = float(amounts.mean())
                     stats['total_paid'] = float(amounts.sum())
+                    
+                    # Moving average: take last N invoices (sorted by date if possible)
+                    if payment_date_col and payment_date_col in paid_df.columns:
+                        # Sort by payment date to get most recent invoices
+                        paid_df_sorted = paid_df.sort_values(by=payment_date_col, ascending=False)
+                        recent_amounts = pd.to_numeric(paid_df_sorted[amount_col].head(MOVING_AVG_WINDOW), errors='coerce')
+                        recent_amounts = recent_amounts.dropna()
+                    else:
+                        # If no date column, just take last N rows
+                        recent_amounts = amounts.tail(MOVING_AVG_WINDOW)
+                    
+                    if len(recent_amounts) > 0:
+                        stats['moving_avg_amount'] = float(recent_amounts.mean())
+                        stats['moving_avg_window'] = len(recent_amounts)
+                        logger.info("  Moving avg calculated from %d most recent invoices", len(recent_amounts))
             
             # Calculate delay statistics
             if payment_date_col and invoice_date_col:
@@ -292,8 +317,9 @@ def query_project(req: QueryRequest):
                     logger.warning("Failed to calculate dates for '%s': %s", alias, e)
             
             customer_stats[alias] = stats
-            logger.info("Customer '%s': %d paid invoices, mean=%.2f, total=%.2f, avg_delay=%.1f days", 
+            logger.info("Customer '%s': %d paid invoices, mean=%.2f, moving_avg=%.2f (window=%d), total=%.2f, avg_delay=%.1f days", 
                        alias, stats['total_invoices'], stats['mean_amount'], 
+                       stats['moving_avg_amount'], stats['moving_avg_window'],
                        stats['total_paid'], stats['avg_delay_days'])
         
         logger.info("-" * 80)
@@ -323,7 +349,8 @@ def query_project(req: QueryRequest):
         for alias, stats in customer_stats.items():
             stats_text += f"Customer: {alias}\n"
             stats_text += f"  - Total paid invoices: {stats['total_invoices']}\n"
-            stats_text += f"  - Mean invoice amount: ₹{stats['mean_amount']:.2f}\n"
+            stats_text += f"  - Overall mean amount: ₹{stats['mean_amount']:.2f}\n"
+            stats_text += f"  - Moving average amount (last {stats['moving_avg_window']} invoices): ₹{stats['moving_avg_amount']:.2f}\n"
             stats_text += f"  - Total amount paid: ₹{stats['total_paid']:.2f}\n"
             stats_text += f"  - Average payment delay: {stats['avg_delay_days']:.1f} days\n"
             if stats['last_payment_date']:
@@ -332,7 +359,8 @@ def query_project(req: QueryRequest):
         stats_text += "-" * 60 + "\n"
     
     prompt = f"""
-You are an expert financial data analyst. 
+You are an expert financial data analyst having a conversation with a business stakeholder. 
+Provide detailed, conversational, and easy-to-understand responses that tell the complete story.
 
 Below is the dataset with CUSTOMER NAMES replaced by ALIASES:
 ------------------------------------------------------------
@@ -345,42 +373,73 @@ USER QUERY:
 
 CRITICAL INSTRUCTIONS:
 The statistics above have been PRECOMPUTED for you. USE THESE EXACT NUMBERS in your response.
+Write in a natural, conversational tone as if you're explaining this to a colleague over coffee.
 
-YOUR TASKS:
-1. Identify which alias(es) the question refers to from the query.
+YOUR APPROACH:
+1. Start with a direct answer to their question
+2. Then elaborate with context and details
+3. Explain what the numbers mean in practical terms
+4. Compare trends to give perspective
+5. Describe patterns you observe in the data
+6. Be specific with numbers, dates, and percentages
+7. Help them understand the "why" behind the numbers
 
-2. FOR AMOUNT PREDICTIONS:
-   - Use the PRECOMPUTED mean_amount from the statistics above
-   - DO NOT recalculate - use the exact number provided
-   - Format: "Expected next invoice amount: ₹[use precomputed mean] (based on [N] paid invoices)"
+CONVERSATIONAL GUIDELINES:
+- Use natural language like "Looking at their payment history..." or "What's interesting here is..."
+- Explain trends: "Their recent invoices have been higher..." or "They've been pretty consistent..."
+- Give context: "Out of X invoices paid..." or "Over the past period..."
+- Make comparisons: "compared to their usual average of..." or "which is about X% higher than before"
+- Describe patterns: "They typically pay within X days..." or "There's a clear upward trend..."
+- Be conversational but professional
+- Avoid bullet points, use flowing paragraphs
+- Don't give recommendations, just describe what you see in the data
 
-3. FOR DATE PREDICTIONS:
-   - Use the precomputed average payment delay
-   - Calculate: next_payment_date = last_payment_date + avg_delay_days
-   - Provide specific date prediction
+AMOUNT PREDICTIONS:
+- Use the precomputed **moving_avg_amount** 
+- Explain it naturally: "Based on their last [window] invoices, they've been averaging around ₹[amount]..."
+- Compare to overall history: "This is actually [higher/lower] than their overall average of ₹[mean], suggesting their invoice amounts are [trending up/down/staying stable]"
+- Mention the percentage difference if significant
+- Explain what this trend might indicate about the business relationship
 
-4. If the customer is mentioned in the query:
-   - Extract their statistics from the PRECOMPUTED section above
-   - Use those exact numbers in your answer
-   - DO NOT attempt to recalculate from the raw data
+DATE PREDICTIONS:
+- Calculate: next_payment_date = last_payment_date + avg_delay_days
+- Describe their payment timing naturally: "They usually take about [X] days to pay after receiving an invoice..."
+- Give the specific expected date: "Since their last payment was on [date], I'd expect the next one around [predicted_date]"
+- Describe their payment behavior: "They're fairly reliable" or "They tend to pay a bit late" etc.
 
-5. Provide final output in this format:
-   **Answer:**
-   Based on [N] paid invoices (from precomputed stats), [customer] has paid a total of ₹[total_paid]. 
-   The average invoice amount is ₹[mean_amount]. 
-   Expected next invoice amount: ₹[mean_amount]
-   
-   **Forecast:**
-   - Next invoice amount: ₹[precomputed mean_amount]
-   - Next payment date: [calculated from last_payment + avg_delay]
-   - Based on: [N] historical invoices, [X] day average delay
-   
-   **Reasoning:**
-   Using precomputed statistics: mean amount ₹[X] from [N] invoices, average delay [Y] days.
+RESPONSE FORMAT:
+Write 3-4 detailed paragraphs that flow naturally, covering:
 
-IMPORTANT: Always use the precomputed statistics provided above. Do not recalculate.
+Paragraph 1: Direct answer with immediate context
+- Answer their specific question right away
+- Give the key numbers (amount and/or date)
+- Mention how many invoices and total paid amount for context
 
-Now produce the answer using the precomputed statistics.
+Paragraph 2: Historical context and patterns
+- Describe their overall payment history
+- Compare recent behavior to historical average
+- Explain any trends you notice (amounts increasing/decreasing, payment timing patterns)
+- Use specific numbers and percentages
+
+Paragraph 3: Detailed forecast explanation
+- Explain the predicted amount using moving average
+- Give the reasoning behind the date prediction
+- Describe their typical payment behavior
+- Mention data quality (how many invoices you're basing this on)
+
+Paragraph 4 (if needed): Additional observations
+- Any interesting patterns in their payment behavior
+- Confidence level in the prediction based on data consistency
+- What the trend direction tells us about the relationship
+
+IMPORTANT: 
+- Write in complete, flowing paragraphs - NO bullet points or lists
+- Be conversational and natural
+- Use the precomputed statistics
+- Include specific numbers, dates, and percentages
+- Make it feel like you're having a conversation, not writing a report
+
+Now provide a detailed, conversational response.
 """
 
     logger.info("✓ Built LLM prompt (%d characters)", len(prompt))

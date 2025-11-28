@@ -1,17 +1,18 @@
 import psycopg2
 import psycopg2.extras
-from config.settings import DATABASE_URL
-
-
-
+from config.settings import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
 
 def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not configured")
-    return psycopg2.connect(DATABASE_URL)
-
-
-
+    if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT]):
+        raise RuntimeError("Database configuration incomplete")
+    
+    return psycopg2.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        port=DB_PORT
+    )
 
 def init_db():
     conn = get_conn()
@@ -19,24 +20,21 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
-        project_name TEXT PRIMARY KEY,
-        s3_url TEXT NOT NULL,
-        uploaded_at TIMESTAMP DEFAULT now()
+            project_name TEXT PRIMARY KEY,
+            s3_url TEXT NOT NULL,
+            uploaded_at TIMESTAMP DEFAULT now()
         );
         CREATE TABLE IF NOT EXISTS project_aliases (
-        project_name TEXT,
-        customer_key TEXT,
-        alias TEXT,
-        PRIMARY KEY (project_name, customer_key)
+            project_name TEXT,
+            customer_key TEXT,
+            alias TEXT,
+            PRIMARY KEY (project_name, customer_key)
         );
         """
     )
     conn.commit()
     cur.close()
     conn.close()
-
-
-
 
 def save_project(project_name: str, s3_url: str):
     conn = get_conn()
@@ -49,9 +47,6 @@ def save_project(project_name: str, s3_url: str):
     cur.close()
     conn.close()
 
-
-
-
 def get_project_url(project_name: str) -> str | None:
     conn = get_conn()
     cur = conn.cursor()
@@ -60,9 +55,6 @@ def get_project_url(project_name: str) -> str | None:
     cur.close()
     conn.close()
     return r[0] if r else None
-
-
-
 
 def upsert_alias(project_name: str, customer_key: str, alias: str):
     conn = get_conn()
@@ -74,9 +66,6 @@ def upsert_alias(project_name: str, customer_key: str, alias: str):
     conn.commit()
     cur.close()
     conn.close()
-
-
-
 
 def get_alias(project_name: str, customer_key: str) -> str | None:
     conn = get_conn()

@@ -1,73 +1,56 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from src.utils.s3_utils import upload_fileobj
+from fastapi import APIRouter, Form, HTTPException
 from src.utils.db import save_project, init_db
-from src.utils.normalize import read_input_file
-from src.utils.aliaser import make_alias
-import io
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# @router.post("/upload")
-# async def upload_file(file: UploadFile = File(...), project_name: str = Form(...)):
-#     # initialize tables (idempotent)
-#     init_db()
-
-#     contents = await file.read()
-#     filelike_for_s3 = io.BytesIO(contents)
-#     filelike_for_pd = io.BytesIO(contents)
-
-#     key = f"{project_name}/{file.filename}"
-
-#     # upload to S3
-#     try:
-#         s3_url = upload_fileobj(filelike_for_s3, key, content_type=file.content_type)
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
-
-#     # Save project record
-#     try:
-#         save_project(project_name, s3_url)
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"DB save failed: {e}")
-
-#     # # parse and precompute aliases
-#     # try:
-#     #     df = read_input_file(filelike_for_pd, file.filename)
-#     #     name_col = "customer_name"
-#     #     if name_col in df.columns:
-#     #         for c in df[name_col].fillna(""):
-#     #             key_val = str(c).strip()
-#     #             if key_val:
-#     #                 make_alias(project_name, key_val)
-#     # except Exception as e:
-#     #     # non-fatal — we've already stored the S3 url, but provide warning
-#     #     return {"message": "uploaded", "s3_url": s3_url, "warning": f"parsing/aliasing failed: {e}"}
-
-#     return {"message": "uploaded", "s3_url": s3_url}
-
-
-
 @router.post("/upload")
-async def upload_file( s3_url : str = Form(...), project_name: str = Form(...)):
-    if not s3_url and project_name:
-        raise HTTPException(status_code=404, detail=f"s3_url and project is required: {e}")
+async def upload_file(s3_url: str = Form(...), project_name: str = Form(...)):
+    """
+    Save S3 URL and project name mapping to database.
+    
+    Args:
+        s3_url: The S3 URL where the file is stored (required)
+        project_name: The project identifier (required)
+    
+    Returns:
+        Success message with the S3 URL
+    """
+    # Validate inputs
+    if not s3_url or not project_name:
+        logger.error("Missing required fields: s3_url=%s, project_name=%s", s3_url, project_name)
+        raise HTTPException(
+            status_code=400, 
+            detail="Both s3_url and project_name are required"
+        )
+    
+    # Validate S3 URL format
+    if not s3_url.startswith(("https://", "s3://")):
+        logger.error("Invalid S3 URL format: %s", s3_url)
+        raise HTTPException(
+            status_code=400,
+            detail="s3_url must be a valid S3 URL (starting with https:// or s3://)"
+        )
+    
+    # Initialize database
     init_db()
+    
     try:
+        # Save project to database
         save_project(project_name, s3_url)
+        logger.info("✓ Successfully saved project '%s' with S3 URL: %s", project_name, s3_url)
+        
+        return {
+            "message": "uploaded",
+            "project_name": project_name,
+            "s3_url": s3_url
+        }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB save failed: {e}")
-
-    # # parse and precompute aliases
-    # try:
-    #     df = read_input_file(filelike_for_pd, file.filename)
-    #     name_col = "customer_name"
-    #     if name_col in df.columns:
-    #         for c in df[name_col].fillna(""):
-    #             key_val = str(c).strip()
-    #             if key_val:
-    #                 make_alias(project_name, key_val)
-    # except Exception as e:
-    #     # non-fatal — we've already stored the S3 url, but provide warning
-    #     return {"message": "uploaded", "s3_url": s3_url, "warning": f"parsing/aliasing failed: {e}"}
-
-    return {"message": "uploaded", "s3_url": s3_url}
+        logger.exception("✗ Failed to save project to database: %s", e)
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Database save failed: {str(e)}"
+        )
