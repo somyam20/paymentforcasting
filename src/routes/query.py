@@ -5,6 +5,7 @@ from src.utils.s3_utils import download_to_bytes
 from src.utils.normalize import read_input_file
 from src.utils.aliaser import make_alias
 from src.llm.lite_client import lite_client
+import pandas as pd
 import io
 import logging
 import traceback
@@ -208,7 +209,102 @@ def query_project(req: QueryRequest):
     else:
         logger.warning("⚠ Skipping query transformation (no mapping available)")
 
-    # 7. Convert to CSV for LLM
+    # 7. Precompute statistics for each customer
+    logger.info("")
+    logger.info("PRECOMPUTING CUSTOMER STATISTICS")
+    logger.info("-" * 80)
+    
+    customer_stats = {}
+    
+    try:
+        # Identify amount column (could be net_amount or total_invoice_amount)
+        amount_col = None
+        for col in ['total_invoice_amount', 'net_amount', 'amount']:
+            if col in df_alias.columns:
+                amount_col = col
+                break
+        
+        if not amount_col:
+            logger.warning("⚠ No amount column found, skipping statistics computation")
+        
+        # Identify date columns
+        payment_date_col = 'payment_date' if 'payment_date' in df_alias.columns else None
+        invoice_date_col = 'invoice_date' if 'invoice_date' in df_alias.columns else None
+        due_date_col = 'due_date' if 'due_date' in df_alias.columns else None
+        
+        logger.info("Using columns: amount=%s, payment_date=%s, invoice_date=%s", 
+                   amount_col, payment_date_col, invoice_date_col)
+        
+        # Get unique customers from aliased dataframe
+        unique_aliases = df_alias[name_col].dropna().unique()
+        
+        for alias in unique_aliases:
+            # Filter data for this customer
+            customer_df = df_alias[df_alias[name_col] == alias].copy()
+            
+            # Filter only paid invoices (where payment_date is not null)
+            if payment_date_col:
+                paid_df = customer_df[customer_df[payment_date_col].notna()].copy()
+            else:
+                paid_df = customer_df.copy()
+            
+            if len(paid_df) == 0:
+                logger.info("Customer '%s': No paid invoices found", alias)
+                continue
+            
+            stats = {
+                'total_invoices': len(paid_df),
+                'mean_amount': 0,
+                'total_paid': 0,
+                'avg_delay_days': 0,
+                'last_payment_date': None
+            }
+            
+            # Calculate amount statistics
+            if amount_col and amount_col in paid_df.columns:
+                # Convert to numeric, handling any string formatting
+                amounts = pd.to_numeric(paid_df[amount_col], errors='coerce')
+                amounts = amounts.dropna()
+                
+                if len(amounts) > 0:
+                    stats['mean_amount'] = float(amounts.mean())
+                    stats['total_paid'] = float(amounts.sum())
+            
+            # Calculate delay statistics
+            if payment_date_col and invoice_date_col:
+                try:
+                    paid_df[payment_date_col] = pd.to_datetime(paid_df[payment_date_col], errors='coerce')
+                    paid_df[invoice_date_col] = pd.to_datetime(paid_df[invoice_date_col], errors='coerce')
+                    
+                    # Calculate delays
+                    delays = (paid_df[payment_date_col] - paid_df[invoice_date_col]).dt.days
+                    delays = delays.dropna()
+                    
+                    if len(delays) > 0:
+                        stats['avg_delay_days'] = float(delays.mean())
+                    
+                    # Get last payment date
+                    last_payment = paid_df[payment_date_col].max()
+                    if pd.notna(last_payment):
+                        stats['last_payment_date'] = last_payment.strftime('%Y-%m-%d')
+                        
+                except Exception as e:
+                    logger.warning("Failed to calculate dates for '%s': %s", alias, e)
+            
+            customer_stats[alias] = stats
+            logger.info("Customer '%s': %d paid invoices, mean=%.2f, total=%.2f, avg_delay=%.1f days", 
+                       alias, stats['total_invoices'], stats['mean_amount'], 
+                       stats['total_paid'], stats['avg_delay_days'])
+        
+        logger.info("-" * 80)
+        logger.info("Computed statistics for %d customers", len(customer_stats))
+        
+    except Exception as e:
+        logger.exception("✗ Failed to compute customer statistics: %s", e)
+        # Continue without stats, LLM will work with raw data
+        customer_stats = {}
+    
+    # 8. Convert to CSV for LLM
     try:
         data_text = df_alias.to_csv(index=False)
         logger.info("✓ Converted dataframe to CSV (%d characters)", len(data_text))
@@ -217,74 +313,79 @@ def query_project(req: QueryRequest):
         logger.exception("✗ Failed to convert dataframe to CSV: %s", e)
         raise HTTPException(status_code=500, detail=f"Failed to convert to CSV: {e}")
 
-    # 8. Build LLM prompt
+    # 9. Build LLM prompt with precomputed statistics
+    
+    # Format statistics for prompt
+    stats_text = ""
+    if customer_stats:
+        stats_text = "\n\nPRECOMPUTED CUSTOMER STATISTICS:\n"
+        stats_text += "-" * 60 + "\n"
+        for alias, stats in customer_stats.items():
+            stats_text += f"Customer: {alias}\n"
+            stats_text += f"  - Total paid invoices: {stats['total_invoices']}\n"
+            stats_text += f"  - Mean invoice amount: ₹{stats['mean_amount']:.2f}\n"
+            stats_text += f"  - Total amount paid: ₹{stats['total_paid']:.2f}\n"
+            stats_text += f"  - Average payment delay: {stats['avg_delay_days']:.1f} days\n"
+            if stats['last_payment_date']:
+                stats_text += f"  - Last payment date: {stats['last_payment_date']}\n"
+            stats_text += "\n"
+        stats_text += "-" * 60 + "\n"
+    
     prompt = f"""
 You are an expert financial data analyst. 
-You MUST ALWAYS perform forecasting when the user asks anything related to:
-- payment date
-- expected amount
-- delay prediction
-- risk analysis
-- next invoice
-- next cashflow
-- trend analysis
-- future projection
-- forecast, estimate, or predict (even implicitly)
 
 Below is the dataset with CUSTOMER NAMES replaced by ALIASES:
 ------------------------------------------------------------
 {data_text}
 ------------------------------------------------------------
+{stats_text}
 
 USER QUERY:
 {transformed_query}
 
-YOUR TASKS (MANDATORY):
-1. Identify which alias(es) the question refers to. If none mentioned, analyze the entire dataset.
-2. Extract ALL relevant historical data:
-   - invoice dates
-   - due dates
-   - payment dates
-   - invoice amounts
-   - delays: (payment_date - invoice_date)
-   - lateness: (payment_date - due_date)
-3. Compute:
-   - average payment delay
-   - median delay
-   - standard deviation of delay
-   - next expected payment date = last_payment_date + avg_delay
-4. FOR AMOUNT PREDICTIONS:
-   - ALWAYS use the MEAN (average) of historical invoice amounts for that specific customer
-   - DO NOT use trends, moving averages, or complex forecasting for amounts
-   - Simply calculate: mean_amount = sum of all amounts paid by that customer / count of invoices
-   - IMPORTANT: Only consider amounts that have been PAID (i.e., rows where payment_date is not null/empty)
-   - Example: "Expected next invoice amount: ₹X (mean of Y paid invoices, total paid: ₹Z)"
-5. FOR DATE PREDICTIONS:
-   - Use average payment delay patterns
-   - Consider day-of-week and seasonal patterns if applicable
-   - Provide specific date predictions based on historical patterns
-6. IF the user asks ANYTHING that implies the future (even indirectly), 
-   YOU MUST provide a CLEAR forecast:
-   - "Predicted next payment date: [specific date]"
-   - "Expected next invoice amount: ₹[mean amount] (average of [N] invoices)"
-   - "Expected revenue next month: ₹[amount]"
-   - "Risk of late payment: [assessment]"
-7. If data is insufficient, still produce the **best possible estimate** 
-   and clearly state uncertainty.
-8. Provide final output in this format:
-   **Answer:**
-   (direct response)
-   **Forecast:**
-   (explicit numeric prediction with mean amount)
-   **Reasoning:**
-   (short and clear, mentioning mean calculation for amounts)
+CRITICAL INSTRUCTIONS:
+The statistics above have been PRECOMPUTED for you. USE THESE EXACT NUMBERS in your response.
 
-Now produce the answer.
+YOUR TASKS:
+1. Identify which alias(es) the question refers to from the query.
+
+2. FOR AMOUNT PREDICTIONS:
+   - Use the PRECOMPUTED mean_amount from the statistics above
+   - DO NOT recalculate - use the exact number provided
+   - Format: "Expected next invoice amount: ₹[use precomputed mean] (based on [N] paid invoices)"
+
+3. FOR DATE PREDICTIONS:
+   - Use the precomputed average payment delay
+   - Calculate: next_payment_date = last_payment_date + avg_delay_days
+   - Provide specific date prediction
+
+4. If the customer is mentioned in the query:
+   - Extract their statistics from the PRECOMPUTED section above
+   - Use those exact numbers in your answer
+   - DO NOT attempt to recalculate from the raw data
+
+5. Provide final output in this format:
+   **Answer:**
+   Based on [N] paid invoices (from precomputed stats), [customer] has paid a total of ₹[total_paid]. 
+   The average invoice amount is ₹[mean_amount]. 
+   Expected next invoice amount: ₹[mean_amount]
+   
+   **Forecast:**
+   - Next invoice amount: ₹[precomputed mean_amount]
+   - Next payment date: [calculated from last_payment + avg_delay]
+   - Based on: [N] historical invoices, [X] day average delay
+   
+   **Reasoning:**
+   Using precomputed statistics: mean amount ₹[X] from [N] invoices, average delay [Y] days.
+
+IMPORTANT: Always use the precomputed statistics provided above. Do not recalculate.
+
+Now produce the answer using the precomputed statistics.
 """
 
     logger.info("✓ Built LLM prompt (%d characters)", len(prompt))
 
-    # 9. Call LLM
+    # 10. Call LLM
     logger.info("")
     logger.info("CALLING LLM")
     logger.info("-" * 80)
@@ -297,7 +398,7 @@ Now produce the answer.
         logger.exception("✗ LLM call failed: %s", e)
         raise HTTPException(status_code=500, detail=f"LLM error: {e}")
 
-    # 10. DE-ALIAS the response
+    # 11. DE-ALIAS the response
     logger.info("")
     logger.info("DE-ALIASING RESPONSE")
     logger.info("-" * 80)
@@ -332,7 +433,7 @@ Now produce the answer.
     else:
         logger.warning("⚠ Skipping de-aliasing (no mapping available)")
 
-    # 11. Extract clean answer
+    # 12. Extract clean answer
     clean_answer = extract_clean_answer(dealiased_response)
     logger.info("")
     logger.info("EXTRACTED CLEAN ANSWER:")
