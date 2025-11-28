@@ -8,6 +8,7 @@ from src.llm.lite_client import lite_client
 import io
 import logging
 import traceback
+import re
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +23,31 @@ router = APIRouter()
 class QueryRequest(BaseModel):
     project_name: str
     query: str
+
+
+def extract_clean_answer(text: str) -> str:
+    """
+    Extract only the answer portion from the LLM response.
+    Removes markdown formatting like ** and extracts text between **Answer:** and **Forecast:**
+    """
+    # Try to find the answer section
+    answer_match = re.search(r'\*\*Answer:\*\*\s*(.*?)(?:\*\*Forecast:\*\*|\*\*Reasoning:\*\*|$)', text, re.DOTALL | re.IGNORECASE)
+    
+    if answer_match:
+        answer = answer_match.group(1).strip()
+    else:
+        # If no structured format found, return the entire text
+        answer = text.strip()
+    
+    # Remove all ** markdown formatting
+    answer = re.sub(r'\*\*', '', answer)
+    
+    # Clean up extra whitespace
+    answer = re.sub(r'\n\s*\n\s*\n+', '\n\n', answer)
+    answer = answer.strip()
+    
+    return answer
+
 
 @router.post("/query")
 def query_project(req: QueryRequest):
@@ -226,24 +252,32 @@ YOUR TASKS (MANDATORY):
    - average payment delay
    - median delay
    - standard deviation of delay
-   - average invoice amount trend (month-over-month)
-   - future expected amount (simple moving average)
    - next expected payment date = last_payment_date + avg_delay
-4. IF the user asks ANYTHING that implies the future (even indirectly), 
+4. FOR AMOUNT PREDICTIONS:
+   - ALWAYS use the MEAN (average) of historical invoice amounts for that specific customer
+   - DO NOT use trends, moving averages, or complex forecasting for amounts
+   - Simply calculate: mean_amount = sum of all amounts paid by that customer / count of invoices
+   - IMPORTANT: Only consider amounts that have been PAID (i.e., rows where payment_date is not null/empty)
+   - Example: "Expected next invoice amount: ₹X (mean of Y paid invoices, total paid: ₹Z)"
+5. FOR DATE PREDICTIONS:
+   - Use average payment delay patterns
+   - Consider day-of-week and seasonal patterns if applicable
+   - Provide specific date predictions based on historical patterns
+6. IF the user asks ANYTHING that implies the future (even indirectly), 
    YOU MUST provide a CLEAR forecast:
-   - "Predicted next payment date: …"
-   - "Predicted next invoice amount: …"
-   - "Expected revenue next month: …"
-   - "Risk of late payment: …"
-5. If data is insufficient, still produce the **best possible estimate** 
+   - "Predicted next payment date: [specific date]"
+   - "Expected next invoice amount: ₹[mean amount] (average of [N] invoices)"
+   - "Expected revenue next month: ₹[amount]"
+   - "Risk of late payment: [assessment]"
+7. If data is insufficient, still produce the **best possible estimate** 
    and clearly state uncertainty.
-6. Provide final output in this format:
+8. Provide final output in this format:
    **Answer:**
    (direct response)
    **Forecast:**
-   (explicit numeric prediction)
+   (explicit numeric prediction with mean amount)
    **Reasoning:**
-   (short and clear)
+   (short and clear, mentioning mean calculation for amounts)
 
 Now produce the answer.
 """
@@ -298,19 +332,18 @@ Now produce the answer.
     else:
         logger.warning("⚠ Skipping de-aliasing (no mapping available)")
 
+    # 11. Extract clean answer
+    clean_answer = extract_clean_answer(dealiased_response)
+    logger.info("")
+    logger.info("EXTRACTED CLEAN ANSWER:")
+    logger.info("%s", clean_answer[:300])
+
     logger.info("")
     logger.info("=" * 80)
     logger.info("QUERY REQUEST COMPLETE")
     logger.info("=" * 80)
 
+    # Return only the clean answer
     return {
-        "model_response": dealiased_response,
-        "transformed_query": transformed_query,
-        "aliases_used": mapping,
-        "original_query": req.query,
-        "debug_info": {
-            "total_aliases": len(mapping),
-            "query_replacements": len(replacements_made),
-            "response_dealias_count": len(dealias_replacements)
-        }
+        "answer": clean_answer
     }
