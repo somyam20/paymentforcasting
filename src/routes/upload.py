@@ -35,11 +35,11 @@ async def upload_file(s3_url: str = Form(...), project_name: str = Form(...)):
         )
     
     # Initialize database
-    init_db()
+    await init_db()
     
     try:
         # Save project to database
-        save_project(project_name, s3_url)
+        await save_project(project_name, s3_url)
         logger.info("✓ Successfully saved project '%s' with S3 URL: %s", project_name, s3_url)
         
         return {

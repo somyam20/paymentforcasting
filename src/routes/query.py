@@ -1,17 +1,21 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Form
+import litellm
+import asyncio
+import requests
 from pydantic import BaseModel
 from src.utils.db import get_project_url, init_db, get_alias
 from src.utils.s3_utils import download_to_bytes, extract_filename_from_url
 from src.utils.normalize import read_input_file
 from src.utils.aliaser import make_alias
-from src.llm.lite_client import lite_client
 from config.settings import MOVING_AVG_WINDOW
+from config.config import get_model_config
 import pandas as pd
 import io
 import logging
 import traceback
 import re
 import os
+import json
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,8 +57,34 @@ def extract_clean_answer(text: str) -> str:
 
 
 @router.post("/query")
-def query_project(req: QueryRequest):
-    init_db()
+async def query_project(
+    req: QueryRequest,
+    user_metadata: str | None = Form(None)  
+    ):
+    user_metadata = json.loads(user_metadata) if user_metadata else {}
+    team_id = user_metadata.get("team_id")
+    try:
+        async with get_model_config() as config:
+            # Get the team's model configuration
+            team_config = await config.get_team_model_config(team_id)
+            model = team_config["selected_model"]
+            provider = team_config["provider"]
+            provider_model = f"{provider}/{model}"
+            model_config = team_config["config"]
+ 
+            # Create LLM instance with the team's configuration
+            llm_params = {
+                "model": provider_model,
+                **model_config  
+            }
+            auth_token = requests.headers.get("Authorization")
+            if auth_token:
+                llm_params.update({"auth_token": auth_token})
+    except Exception as e:
+        logging.error(f"Error extracting attendees: {str(e)}")
+        return []
+
+    await init_db()
     logger.info("=" * 80)
     logger.info("QUERY REQUEST START")
     logger.info("Project: %s", req.project_name)
@@ -62,7 +92,7 @@ def query_project(req: QueryRequest):
     logger.info("=" * 80)
 
     # 1. Get S3 URL
-    s3_url = get_project_url(req.project_name)
+    s3_url = await get_project_url(req.project_name)
     if not s3_url:
         logger.error("Project not found in DB: %s", req.project_name)
         raise HTTPException(status_code=404, detail="project not found")
@@ -70,7 +100,7 @@ def query_project(req: QueryRequest):
 
     # 2. Download file
     try:
-        data_bytes = download_to_bytes(s3_url)
+        data_bytes = await download_to_bytes(s3_url)
         logger.info("✓ Downloaded %d bytes from S3", len(data_bytes) if data_bytes else 0)
     except Exception as e:
         logger.exception("✗ Failed to download from S3: %s", e)
@@ -82,7 +112,7 @@ def query_project(req: QueryRequest):
 
     # 3. Parse file
     try:
-        df = read_input_file(io.BytesIO(data_bytes), filename)
+        df = await read_input_file(io.BytesIO(data_bytes), filename)
         logger.info("✓ Parsed dataframe: shape=%s", df.shape)
         logger.info("✓ Columns: %s", list(df.columns))
         logger.info("✓ First 3 rows:\n%s", df.head(3).to_string(index=False))
@@ -123,7 +153,7 @@ def query_project(req: QueryRequest):
             logger.info("Processing customer %d/%d: '%s'", idx + 1, len(unique_customers), cust)
             
             # Check if alias already exists
-            alias = get_alias(req.project_name, cust)
+            alias = await get_alias(req.project_name, cust)
             
             if alias:
                 logger.info("  ✓ Found existing alias: '%s' -> '%s'", cust, alias)
@@ -131,7 +161,7 @@ def query_project(req: QueryRequest):
             else:
                 logger.info("  ⚙ No existing alias, generating new one...")
                 try:
-                    alias = make_alias(req.project_name, cust)
+                    alias = await make_alias(req.project_name, cust)
                     logger.info("  ✓ Generated new alias: '%s' -> '%s'", cust, alias)
                     mapping[cust] = alias
                 except Exception as ex_alias:
@@ -450,7 +480,7 @@ Now provide a detailed, conversational response.
     logger.info("-" * 80)
     
     try:
-        llm_response = lite_client.generate(prompt)
+        llm_response = await asyncio.to_thread(lite_client.generate, prompt)
         logger.info("✓ LLM responded (%d characters)", len(llm_response))
         logger.info("LLM response preview:\n%s", llm_response[:500])
     except Exception as e:

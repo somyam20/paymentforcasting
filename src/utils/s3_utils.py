@@ -1,4 +1,4 @@
-import boto3
+import aioboto3
 import io
 from botocore.exceptions import ClientError
 from config.settings import AWS_REGION, AWS_S3_BUCKET, S3_UPLOAD_PREFIX
@@ -7,17 +7,19 @@ from urllib.parse import urlparse, unquote, parse_qs
 
 logger = logging.getLogger(__name__)
 
-s3_client = boto3.client("s3", region_name=AWS_REGION)
+# Create aioboto3 session
+session = aioboto3.Session()
 
 
-def upload_fileobj(fileobj, key: str, content_type: str = None) -> str:
+async def upload_fileobj(fileobj, key: str, content_type: str = None) -> str:
     """Upload a file-like object to S3 and return the object URL."""
     try:
         extra_args = {}
         if content_type:
             extra_args["ContentType"] = content_type
 
-        s3_client.upload_fileobj(fileobj, AWS_S3_BUCKET, key, ExtraArgs=extra_args)
+        async with session.client("s3", region_name=AWS_REGION) as s3_client:
+            await s3_client.upload_fileobj(fileobj, AWS_S3_BUCKET, key, ExtraArgs=extra_args)
 
         url = f"https://{AWS_S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{key}"
         return url
@@ -45,7 +47,7 @@ def extract_filename_from_url(s3_url: str) -> str:
     return filename
 
 
-def download_to_bytes(s3_url: str) -> bytes:
+async def download_to_bytes(s3_url: str) -> bytes:
     """
     Download an S3 object based on the URL and return bytes.
     
@@ -95,8 +97,10 @@ def download_to_bytes(s3_url: str) -> bytes:
         logger.info("Attempting to download from bucket '%s' with key '%s'", bucket_to_use, key)
         
         # Download the object
-        obj = s3_client.get_object(Bucket=bucket_to_use, Key=key)
-        data = obj["Body"].read()
+        async with session.client("s3", region_name=AWS_REGION) as s3_client:
+            obj = await s3_client.get_object(Bucket=bucket_to_use, Key=key)
+            async with obj["Body"] as stream:
+                data = await stream.read()
         
         logger.info("✓ Successfully downloaded %d bytes", len(data))
         return data

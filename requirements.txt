@@ -9,3 +9,5 @@ openpyxl
 python-dotenv
 litellm
 botocore
+asyncpg
+aioboto3

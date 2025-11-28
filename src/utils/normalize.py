@@ -1,6 +1,8 @@
 import pandas as pd
 from config.settings import EXPECTED_COLS
 import logging
+import asyncio
+from functools import partial
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +127,7 @@ def normalize_columns(df):
     
     return df_renamed
 
-def read_input_file(file_obj, filename: str):
+async def read_input_file(file_obj, filename: str):
     """
     Read Excel or CSV file uploaded by user.
     Excel: header on row 3 -> header=2, usecols from column B onward (we drop the first column if unnamed)
@@ -135,9 +137,16 @@ def read_input_file(file_obj, filename: str):
     logger.info("Reading file: %s", filename)
     
     lower = filename.lower()
+    
+    # Run pandas I/O operations in thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+    
     if lower.endswith(".xlsx") or lower.endswith(".xls"):
         # read header from row 3 (0-based index 2)
-        df = pd.read_excel(file_obj, header=2)
+        df = await loop.run_in_executor(
+            None, 
+            partial(pd.read_excel, file_obj, header=2)
+        )
         logger.info("✓ Read Excel file with shape: %s", df.shape)
         
         # If there is an unnamed left-most column (common when sheet has offset), drop it
@@ -145,7 +154,10 @@ def read_input_file(file_obj, filename: str):
             logger.info("→ Dropping unnamed first column")
             df = df.iloc[:, 1:]
     elif lower.endswith(".csv"):
-        df = pd.read_csv(file_obj)
+        df = await loop.run_in_executor(
+            None,
+            partial(pd.read_csv, file_obj)
+        )
         logger.info("✓ Read CSV file with shape: %s", df.shape)
     else:
         raise ValueError("Unsupported file type")

@@ -17,9 +17,9 @@ def _num_to_base(n: int, alphabet: str = ALPHABET) -> str:
         out.append(alphabet[r])
     return ''.join(reversed(out)) or alphabet[0]
 
-def make_alias(project_name: str, customer_key: str) -> str:
+async def make_alias(project_name: str, customer_key: str) -> str:
     try:
-        existing = get_alias(project_name, customer_key)
+        existing = await get_alias(project_name, customer_key)
         if existing:
             logger.debug("make_alias: existing alias for project=%s customer=%s -> %s", project_name, customer_key, existing)
             return existing
@@ -28,7 +28,7 @@ def make_alias(project_name: str, customer_key: str) -> str:
         num = int(digest[:16], 16)
         alias = _num_to_base(num)[:ALIAS_LENGTH]
 
-        upsert_alias(project_name, customer_key, alias)
+        await upsert_alias(project_name, customer_key, alias)
         logger.info("make_alias: created alias for project=%s customer=%s -> %s", project_name, customer_key, alias)
         return alias
     except Exception as e:
