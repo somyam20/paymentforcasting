@@ -76,8 +76,8 @@ env   # Database Configuration
    AWS_SECRET_ACCESS_KEY=your_secret_key
    
    # LiteLLM Configuration
-   LITE_LLM_API_KEY=your_api_key
-   LITE_LLM_MODEL=gemini/gemini-2.5-flash-lite
+   <!-- LITE_LLM_API_KEY=your_api_key
+   LITE_LLM_MODEL=gemini/gemini-2.5-flash-lite -->
    
    # Aliasing Configuration
    ALIAS_SALT=your_random_salt_string

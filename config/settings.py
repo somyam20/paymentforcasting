@@ -35,8 +35,8 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 MOVING_AVG_WINDOW=os.getenv("MOVING_AVG_WINDOWS","3")
 
 # Lite LLM / model configuration
-LITE_LLM_API_KEY = os.getenv("LITE_LLM_API_KEY")
-LITE_LLM_MODEL = os.getenv("LITE_LLM_MODEL", "gemini/gemini-2.5-flash-lite")
+# LITE_LLM_API_KEY = os.getenv("LITE_LLM_API_KEY")
+# LITE_LLM_MODEL = os.getenv("LITE_LLM_MODEL", "gemini/gemini-2.5-flash-lite")
 
 
 # Upload settings
