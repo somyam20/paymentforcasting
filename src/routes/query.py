@@ -510,7 +510,7 @@
 
 
 
-from fastapi import APIRouter, HTTPException, Form
+from fastapi import APIRouter, HTTPException, Form, Request
 from src.utils.db import get_project_url, init_db, get_alias
 from src.utils.s3_utils import download_to_bytes, extract_filename_from_url
 from src.utils.normalize import read_input_file
@@ -529,7 +529,7 @@ from config.config import get_model_config
 import json
 import requests
 import litellm
-# from src.utils.obs import LLMUsageTracker
+from src.utils.obs import LLMUsageTracker
 
 
 
@@ -813,6 +813,7 @@ def format_customer_stats(customer_stats: dict) -> str:
 
 @router.post("/query")
 async def query_project(
+    req: Request,
     project_name: str = Form(...),
     query: str = Form(...),
     user_metadata: str = Form(...)
@@ -838,7 +839,6 @@ async def query_project(
     )
     """
     
-    
     user_metadata = json.loads(user_metadata) if user_metadata else {}
     team_id = user_metadata.get("team_id")
     try:
@@ -855,7 +855,7 @@ async def query_project(
                 "model": provider_model,
                 **model_config  
             }
-            auth_token = requests.headers.get("Authorization")
+            auth_token = req.headers.get("Authorization")
             if auth_token:
                 llm_params.update({"auth_token": auth_token})
     except Exception as e:
@@ -1011,17 +1011,21 @@ async def query_project(
     
     try:
         auth_token = llm_params.pop("auth_token", "")
-        llm_response =litellm.completion({
+        llm_response = litellm.completion(
             **llm_params,
-            "messages": [{"role": "user", "content": prompt}],
-        })
-        print(llm_response,"llm_response")
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        # print("llm_response", llm_response)
+        token_tracker = LLMUsageTracker()
+        token_tracker.track_response(response=llm_response, auth_token=auth_token, model=llm_params.get("model", ""))
+        response_text = llm_response.choices[0].message.content.strip()
+        print("response_text", response_text)
         
-        # token_tracker = LLMUsageTracker()
         # token_tracker.track_response(response=response, auth_token=self.auth_token, model=llm_params.get("model", ""))
         
         # llm_response = await lite_client.async_generate(prompt)
-        logger.info("✓ LLM responded (%d characters)", len(llm_response))
+        logger.info("✓ LLM responded (%d characters)", llm_response)
         logger.info("LLM response preview:\n%s", llm_response[:500])
     except Exception as e:
         logger.exception("✗ LLM call failed: %s", e)
