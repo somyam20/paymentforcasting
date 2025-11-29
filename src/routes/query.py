@@ -4,7 +4,6 @@ from src.utils.s3_utils import download_to_bytes, extract_filename_from_url
 from src.utils.normalize import read_input_file
 from src.utils.aliaser import make_alias
 from src.utils.prompts_loader import format_prompt
-from src.llm.lite_client import lite_client
 from config.settings import MOVING_AVG_WINDOW
 import pandas as pd
 import io
