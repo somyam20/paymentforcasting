@@ -167,9 +167,4 @@ class LLMUsageTracker:
             logging.warning(f"Could not decode JWT. Token part used: '{jwt_part[:30]}...'. Error: {e}")
             user_email = "N/A"
         
-        # except Exception as e:  # PyJWT doesn't have PyJWTError
-        #     logging.error(f"JWT decode failed: {e}")
-        #     # return None, None
-        #     user_email = "N/A"
-        
         return user_email, encrypted_payload
